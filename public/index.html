@@ -21,10 +21,10 @@
       <h2>Create job</h2>
       <form id="uploadForm">
         <label>Lecture slides / PDF
-          <input id="slides" type="file" accept="application/pdf,.pdf" multiple required />
+          <input id="slides" type="file" accept="application/pdf,.pdf,.pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" required />
         </label>
-        <label>Lecture audio
-          <input id="audio" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac,.webm" multiple required />
+        <label>Lecture audio (WAV only for MVP)
+          <input id="audio" type="file" accept=".wav,audio/wav,audio/x-wav" required />
         </label>
         <label>Exam papers / past tests (optional)
           <input id="examPapers" type="file" accept="application/pdf,.pdf,text/plain,.txt,.md,.json" multiple />

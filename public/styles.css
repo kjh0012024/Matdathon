@@ -46,6 +46,7 @@ button, .download {
 .error { color: #ff8c8c; }
 .jobs { display: grid; gap: 14px; }
 .job { padding: 16px; border-radius: 18px; background: rgba(255,255,255,.03); border: 1px solid rgba(153,179,255,.14); }
+.job details { border-top: 1px solid rgba(153,179,255,.14); padding-top: 10px; }
 .status { text-transform: capitalize; font-size: 12px; padding: 6px 10px; border-radius: 999px; background: rgba(255,255,255,.07); }
 .status.completed { background: rgba(77, 197, 131, .16); color: #8bffbf; }
 .status.failed { background: rgba(255, 94, 94, .16); color: #ff9e9e; }
