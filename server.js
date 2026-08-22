@@ -14,6 +14,7 @@ const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const jobs = new Map();
 const scheduled = new Map();
 const supportedAudioExts = new Set(['.wav']);
+const supportedSlideExts = new Set(['.pdf', '.pptx']);
 
 async function ensureDirs() {
   await fsp.mkdir(PUBLIC_DIR, { recursive: true });
@@ -30,6 +31,10 @@ function extName(name) {
 
 function isPdf(file) {
   return file?.type === 'application/pdf' || extName(file?.name) === '.pdf';
+}
+
+function isSlideFile(file) {
+  return isPdf(file) || supportedSlideExts.has(extName(file?.name));
 }
 
 function isAudio(file) {
@@ -58,6 +63,12 @@ function createStorageAdapter() {
     },
     async readArtifact(jobId, fileName) {
       return fsp.readFile(path.join(JOBS_DIR, jobId, fileName));
+    },
+    async deleteJob(jobId) {
+      jobs.delete(jobId);
+      const jobDir = path.join(JOBS_DIR, jobId);
+      await fsp.rm(jobDir, { recursive: true, force: true });
+      await saveState();
     }
   };
 }
@@ -65,15 +76,32 @@ function createStorageAdapter() {
 function createTranscriptAdapter() {
   return {
     transcribe(job) {
+      const chunks = job.inputs.audio.map((file, index) => ({
+        id: index + 1,
+        start: index * 60,
+        end: (index + 1) * 60,
+        text: `Transcript chunk from ${file.name}`
+      }));
       return {
         provider: 'local-placeholder',
-        chunks: job.inputs.audio.map((file, index) => ({
-          id: index + 1,
-          start: index * 60,
-          end: (index + 1) * 60,
-          text: `Transcript chunk from ${file.name}`
-        }))
+        chunks
       };
+    }
+  };
+}
+
+function createCopilotOrchestrator() {
+  return {
+    runStage(stageName, input, handler) {
+      const result = handler(input);
+      return result;
+    },
+    runPipeline(job, stages) {
+      const output = {};
+      for (const stage of stages) {
+        output[stage.name] = this.runStage(stage.name, stage.input(job, output), stage.handler);
+      }
+      return handler(input);
     }
   };
 }
@@ -105,6 +133,7 @@ const storage = createStorageAdapter();
 const transcriptAdapter = createTranscriptAdapter();
 const slideParser = createSlideParser();
 const pdfRenderer = createPdfRenderer();
+const copilotOrchestrator = createCopilotOrchestrator();
 
 async function readJson(file, fallback) {
   try {
@@ -176,15 +205,43 @@ function buildPromptOrder(job) {
 
 function makeAnnotations(job, transcript) {
   const slides = slideParser.parse(job);
-  const chunks = transcript.chunks.length ? transcript.chunks : [{ id: 1, text: 'No audio transcript available' }];
-  return slides.map((slide, index) => ({
-    slide: slide.page,
-    transcriptRef: `Transcript chunk ${chunks[index % chunks.length].id}`,
-    emphasis: index === 0
-      ? 'Priority topic from lecture + exam signals'
-      : 'Placeholder alignment',
-    slideTitle: slide.title
-  }));
+  const chunks = transcript.chunks.length ? transcript.chunks : [{ id: 1, start: 0, end: 60, text: 'No audio transcript available' }];
+  return slides.map((slide, index) => {
+    const chunk = chunks[Math.min(index, chunks.length - 1)];
+    return {
+      slide: slide.page,
+      transcriptRef: `Transcript chunk ${chunk.id} (${chunk.start}-${chunk.end}s)`,
+      emphasis: index === 0
+        ? 'Priority topic from lecture + exam signals'
+        : 'Aligned by temporal chunk order',
+      slideTitle: slide.title,
+      transcriptText: chunk.text
+    };
+  });
+}
+
+function classifyJobStage(errorMessage) {
+  const message = String(errorMessage || '').toLowerCase();
+  if (message.includes('transcript')) return 'transcription';
+  if (message.includes('slide')) return 'slide-matching';
+  if (message.includes('pdf')) return 'pdf-generation';
+  if (message.includes('ocr')) return 'ocr';
+  return 'processing';
+}
+
+function extractJobStageResult(job) {
+  return {
+    transcript: transcriptAdapter.transcribe(job),
+    slides: slideParser.parse(job)
+  };
+}
+
+function parseAndMatch(job) {
+  const transcript = transcriptAdapter.transcribe(job);
+  return {
+    transcript,
+    annotations: makeAnnotations(job, transcript)
+  };
 }
 
 function escapePdfText(text) {
@@ -239,8 +296,10 @@ async function processJob(jobId) {
       job.updatedAt = nowIso();
       await saveState();
 
-      const transcript = transcriptAdapter.transcribe(job);
-      const annotations = makeAnnotations(job, transcript);
+      const stageResult = copilotOrchestrator.runStage('parsing-and-transcription', job, extractJobStageResult);
+      const matched = copilotOrchestrator.runStage('slide-matching', { job, transcript: stageResult.transcript }, ({ job: currentJob, transcript: currentTranscript }) => parseAndMatch(currentJob, currentTranscript));
+      const transcript = stageResult.transcript;
+      const annotations = matched.annotations;
       const summaryLines = [
         'AgentA+ Study Packet',
         `Job: ${job.id}`,
@@ -261,7 +320,6 @@ async function processJob(jobId) {
           : 'No exam paper provided; review signals remain lower priority.'
       ];
       const pdfBuffer = pdfRenderer.render(summaryLines);
-      const jobDir = path.join(JOBS_DIR, jobId);
       await storage.writeArtifact(jobId, 'study-packet.pdf', pdfBuffer);
       await storage.writeArtifact(jobId, 'result.json', Buffer.from(JSON.stringify({
         annotations,
@@ -288,6 +346,8 @@ async function processJob(jobId) {
       job.status = 'failed';
       job.progress = 100;
       job.error = error.message || 'Unknown failure';
+      job.failedStage = classifyJobStage(job.error);
+      job.retryGuidance = `Retry from ${job.failedStage} after correcting the input or transient error.`;
       job.updatedAt = nowIso();
       await saveState();
     }
@@ -329,7 +389,11 @@ async function handleCreateJob(req, res) {
     return sendJson(res, 400, { error: 'Lecture slide/PDF and lecture audio are required.' });
   }
 
-  const invalid = [...slideFiles, ...audioFiles, ...examFiles].find(file => file && !isPdf(file) && !isAudio(file) && !isTextFile(file));
+  if (slideFiles.length > 1 || audioFiles.length > 1) {
+    return sendJson(res, 400, { error: 'The MVP supports one slide/PDF and one WAV audio file per job.' });
+  }
+
+  const invalid = [...slideFiles, ...audioFiles, ...examFiles].find(file => file && !isSlideFile(file) && !isAudio(file) && !isTextFile(file));
   if (invalid) {
     return sendJson(res, 400, { error: `Unsupported file type: ${invalid.name || 'unknown file'}` });
   }
@@ -381,6 +445,14 @@ async function handleCreateJob(req, res) {
   return sendJson(res, 201, { job: summarizeJob(job) });
 }
 
+async function handleDeleteJob(req, res, jobId) {
+  if (!jobs.has(jobId)) {
+    return sendJson(res, 404, { error: 'Job not found' });
+  }
+  await storage.deleteJob(jobId);
+  return sendJson(res, 200, { ok: true });
+}
+
 function sendJson(res, status, payload) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(payload));
@@ -392,6 +464,14 @@ async function serveStatic(req, res, urlPath) {
     res.writeHead(403);
     res.end('Forbidden');
     return;
+  }
+
+  async function handleJobDetail(req, res, jobId) {
+    const job = jobs.get(jobId);
+    if (!job) {
+      return sendJson(res, 404, { error: 'Job not found' });
+    }
+    return sendJson(res, 200, summarizeJob(job));
   }
   try {
     const data = await fsp.readFile(filePath);
@@ -426,8 +506,16 @@ async function start() {
       if (req.method === 'GET' && url.pathname === '/api/jobs') {
         return sendJson(res, 200, { jobs: [...jobs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map(summarizeJob) });
       }
+      if (req.method === 'GET' && /^\/api\/jobs\/[^/]+$/.test(url.pathname)) {
+        const jobId = url.pathname.split('/')[3];
+        return await handleJobDetail(req, res, jobId);
+      }
       if (req.method === 'POST' && url.pathname === '/api/jobs') {
         return await handleCreateJob(req, res);
+      }
+      if (req.method === 'DELETE' && /^\/api\/jobs\/[^/]+$/.test(url.pathname)) {
+        const jobId = url.pathname.split('/')[3];
+        return await handleDeleteJob(req, res, jobId);
       }
       if (req.method === 'GET' && /^\/api\/jobs\/[^/]+\/result\.pdf$/.test(url.pathname)) {
         const jobId = url.pathname.split('/')[3];
