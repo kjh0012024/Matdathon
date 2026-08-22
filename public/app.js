@@ -44,6 +44,12 @@ function renderJobs(jobs) {
         <div><span>WAV audio</span>${job.inputs.audio.length}</div>
         <div><span>Exam papers</span>${job.inputs.examPapers.length}</div>
       </div>
+      ${job.stages?.length ? `
+        <details>
+          <summary>Stages</summary>
+          <pre>${job.stages.map(stage => `${stage.name}: ${stage.status}${stage.errorMessage ? ` (${stage.errorMessage})` : ''}`).join('\n')}</pre>
+        </details>
+      ` : ''}
       ${job.error ? `<p class="error">${job.error}</p>` : ''}
       ${job.failedStage ? `<p class="result">Failed stage: ${job.failedStage}${job.retryGuidance ? ` · ${job.retryGuidance}` : ''}</p>` : ''}
       ${job.result ? `

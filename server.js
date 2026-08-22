@@ -3,6 +3,10 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
+const { createCopilotStageRunner } = require('./src/orchestration/copilot');
+const { runTranscriptStage } = require('./src/pipeline/transcript');
+const { runSlideMatchStage } = require('./src/pipeline/slide-match');
+const { runPackagingStage } = require('./src/pipeline/pdf');
 
 const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
@@ -13,8 +17,6 @@ const STATE_FILE = path.join(DATA_DIR, 'state.json');
 
 const jobs = new Map();
 const scheduled = new Map();
-const supportedAudioExts = new Set(['.wav']);
-const supportedSlideExts = new Set(['.pdf', '.pptx']);
 
 async function ensureDirs() {
   await fsp.mkdir(PUBLIC_DIR, { recursive: true });
@@ -33,12 +35,8 @@ function isPdf(file) {
   return file?.type === 'application/pdf' || extName(file?.name) === '.pdf';
 }
 
-function isSlideFile(file) {
-  return isPdf(file) || supportedSlideExts.has(extName(file?.name));
-}
-
 function isAudio(file) {
-  return (file?.type || '').startsWith('audio/') || supportedAudioExts.has(extName(file?.name));
+  return (file?.type || '').startsWith('audio/') || extName(file?.name) === '.wav';
 }
 
 function isTextFile(file) {
@@ -51,9 +49,6 @@ function createStorageAdapter() {
       jobs.set(jobId, job);
       await saveState();
     },
-    async loadJobs() {
-      return [...jobs.values()];
-    },
     async writeArtifact(jobId, fileName, buffer) {
       const jobDir = path.join(JOBS_DIR, jobId);
       await fsp.mkdir(jobDir, { recursive: true });
@@ -61,47 +56,10 @@ function createStorageAdapter() {
       await fsp.writeFile(filePath, buffer);
       return filePath;
     },
-    async readArtifact(jobId, fileName) {
-      return fsp.readFile(path.join(JOBS_DIR, jobId, fileName));
-    },
     async deleteJob(jobId) {
       jobs.delete(jobId);
-      const jobDir = path.join(JOBS_DIR, jobId);
-      await fsp.rm(jobDir, { recursive: true, force: true });
+      await fsp.rm(path.join(JOBS_DIR, jobId), { recursive: true, force: true });
       await saveState();
-    }
-  };
-}
-
-function createTranscriptAdapter() {
-  return {
-    transcribe(job) {
-      const chunks = job.inputs.audio.map((file, index) => ({
-        id: index + 1,
-        start: index * 60,
-        end: (index + 1) * 60,
-        text: `Transcript chunk from ${file.name}`
-      }));
-      return {
-        provider: 'local-placeholder',
-        chunks
-      };
-    }
-  };
-}
-
-function createCopilotOrchestrator() {
-  return {
-    runStage(stageName, input, handler) {
-      const result = handler(input);
-      return result;
-    },
-    runPipeline(job, stages) {
-      const output = {};
-      for (const stage of stages) {
-        output[stage.name] = this.runStage(stage.name, stage.input(job, output), stage.handler);
-      }
-      return handler(input);
     }
   };
 }
@@ -109,36 +67,27 @@ function createCopilotOrchestrator() {
 function createSlideParser() {
   return {
     parse(job) {
-      const slideCount = Math.max(1, job.inputs.slides.length);
       return job.inputs.slides.map((file, index) => ({
         page: index + 1,
         title: `Slide ${index + 1}`,
         source: file.name,
-        content: `Parsed content from ${file.name}`,
-        slideCount
+        content: `Parsed content from ${file.name}`
       }));
     }
   };
 }
 
-function createPdfRenderer() {
-  return {
-    render(lines) {
-      return buildPdfBuffer(lines);
-    }
-  };
-}
-
 const storage = createStorageAdapter();
-const transcriptAdapter = createTranscriptAdapter();
 const slideParser = createSlideParser();
-const pdfRenderer = createPdfRenderer();
-const copilotOrchestrator = createCopilotOrchestrator();
+const copilotRunner = createCopilotStageRunner({
+  transcriptStage: runTranscriptStage,
+  matchStage: runSlideMatchStage,
+  packageStage: runPackagingStage
+});
 
 async function readJson(file, fallback) {
   try {
-    const raw = await fsp.readFile(file, 'utf8');
-    return JSON.parse(raw);
+    return JSON.parse(await fsp.readFile(file, 'utf8'));
   } catch {
     return fallback;
   }
@@ -157,12 +106,6 @@ async function saveState() {
   await writeJson(STATE_FILE, { jobs: [...jobs.values()] });
 }
 
-function base64ToBuffer(dataUrlOrBase64) {
-  const value = String(dataUrlOrBase64 || '');
-  const raw = value.includes(',') ? value.split(',').pop() : value;
-  return Buffer.from(raw, 'base64');
-}
-
 function nowIso() {
   return new Date().toISOString();
 }
@@ -179,12 +122,15 @@ function summarizeJob(job) {
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     error: job.error || null,
+    failedStage: job.failedStage || null,
+    retryGuidance: job.retryGuidance || null,
+    stages: job.stages || [],
     inputs: {
       slides: job.inputs.slides.map(({ name, size, type }) => ({ name, size, type })),
       audio: job.inputs.audio.map(({ name, size, type }) => ({ name, size, type })),
       examPapers: job.inputs.examPapers.map(({ name, size, type }) => ({ name, size, type })),
       examText: job.inputs.examText ? { length: job.inputs.examText.length } : null,
-      reviewText: job.inputs.reviewText ? { length: job.inputs.reviewText.length } : null,
+      reviewText: job.inputs.reviewText ? { length: job.inputs.reviewText.length } : null
     },
     result: job.result ? {
       pdfUrl: `/api/jobs/${job.id}/result.pdf`,
@@ -203,21 +149,19 @@ function buildPromptOrder(job) {
   return priorities;
 }
 
-function makeAnnotations(job, transcript) {
-  const slides = slideParser.parse(job);
-  const chunks = transcript.chunks.length ? transcript.chunks : [{ id: 1, start: 0, end: 60, text: 'No audio transcript available' }];
-  return slides.map((slide, index) => {
-    const chunk = chunks[Math.min(index, chunks.length - 1)];
-    return {
-      slide: slide.page,
-      transcriptRef: `Transcript chunk ${chunk.id} (${chunk.start}-${chunk.end}s)`,
-      emphasis: index === 0
-        ? 'Priority topic from lecture + exam signals'
-        : 'Aligned by temporal chunk order',
-      slideTitle: slide.title,
-      transcriptText: chunk.text
-    };
-  });
+function validateStageOutput(stageName, output) {
+  if (!output) throw new Error(`${stageName} produced no output`);
+}
+
+function updateStage(job, stageName, patch) {
+  const stages = job.stages || [];
+  let stage = stages.find(item => item.name === stageName);
+  if (!stage) {
+    stage = { name: stageName };
+    stages.push(stage);
+  }
+  Object.assign(stage, patch);
+  job.stages = stages;
 }
 
 function classifyJobStage(errorMessage) {
@@ -225,129 +169,99 @@ function classifyJobStage(errorMessage) {
   if (message.includes('transcript')) return 'transcription';
   if (message.includes('slide')) return 'slide-matching';
   if (message.includes('pdf')) return 'pdf-generation';
-  if (message.includes('ocr')) return 'ocr';
   return 'processing';
 }
 
-function extractJobStageResult(job) {
-  return {
-    transcript: transcriptAdapter.transcribe(job),
-    slides: slideParser.parse(job)
-  };
+async function deleteJobArtifacts(jobId) {
+  await fsp.rm(path.join(JOBS_DIR, jobId), { recursive: true, force: true });
 }
 
-function parseAndMatch(job) {
-  const transcript = transcriptAdapter.transcribe(job);
-  return {
-    transcript,
-    annotations: makeAnnotations(job, transcript)
-  };
+async function deleteJobRecord(jobId) {
+  jobs.delete(jobId);
+  await saveState();
 }
 
-function escapePdfText(text) {
-  return String(text)
-    .replace(/\\/g, '\\\\')
-    .replace(/\(/g, '\\(')
-    .replace(/\)/g, '\\)')
-    .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, '?');
-}
-
-function buildPdfBuffer(lines) {
-  const contentLines = [];
-  let y = 750;
-  for (const line of lines) {
-    contentLines.push(`BT /F1 12 Tf 72 ${y} Td (${escapePdfText(line)}) Tj ET`);
-    y -= 18;
-    if (y < 72) break;
-  }
-  const content = contentLines.join('\n');
-  const objects = [];
-  objects.push('<< /Type /Catalog /Pages 2 0 R >>');
-  objects.push('<< /Type /Pages /Kids [3 0 R] /Count 1 >>');
-  objects.push('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>');
-  objects.push(`<< /Length ${Buffer.byteLength(content, 'utf8')} >>\nstream\n${content}\nendstream`);
-  objects.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
-
-  let pdf = '%PDF-1.4\n';
-  const offsets = [0];
-  for (let i = 0; i < objects.length; i += 1) {
-    offsets.push(Buffer.byteLength(pdf, 'utf8'));
-    pdf += `${i + 1} 0 obj\n${objects[i]}\nendobj\n`;
-  }
-  const xrefStart = Buffer.byteLength(pdf, 'utf8');
-  pdf += `xref\n0 ${objects.length + 1}\n`;
-  pdf += '0000000000 65535 f \n';
-  for (let i = 1; i < offsets.length; i += 1) {
-    pdf += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
-  }
-  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
-  return Buffer.from(pdf, 'utf8');
-}
-
-async function processJob(jobId) {
+async function processJob(jobId, runner) {
   if (scheduled.has(jobId)) return;
   const timer = setTimeout(async () => {
     scheduled.delete(jobId);
     const job = jobs.get(jobId);
     if (!job || job.status !== 'queued') return;
+
     try {
       job.status = 'processing';
-      job.progress = 35;
-      job.updatedAt = nowIso();
+      job.progress = 10;
+      updateStage(job, 'parsing-and-transcription', { status: 'running', startedAt: nowIso() });
       await saveState();
 
-      const stageResult = copilotOrchestrator.runStage('parsing-and-transcription', job, extractJobStageResult);
-      const matched = copilotOrchestrator.runStage('slide-matching', { job, transcript: stageResult.transcript }, ({ job: currentJob, transcript: currentTranscript }) => parseAndMatch(currentJob, currentTranscript));
-      const transcript = stageResult.transcript;
-      const annotations = matched.annotations;
-      const summaryLines = [
-        'AgentA+ Study Packet',
-        `Job: ${job.id}`,
-        `Priority order: ${buildPromptOrder(job).join(' > ') || 'lecture materials'}`,
-        `Audio transcription: ${transcript.provider}`,
-        `Slides: ${job.inputs.slides.length}`,
-        `Audio files: ${job.inputs.audio.length}`,
-        `Exam papers: ${job.inputs.examPapers.length}`,
-        `Exam text length: ${job.inputs.examText ? job.inputs.examText.length : 0}`,
-        `Review length: ${job.inputs.reviewText ? job.inputs.reviewText.length : 0}`,
-        '',
-        'Alignment placeholder:',
-        ...annotations.map(a => `Slide ${a.slide} -> ${a.transcriptRef} (${a.emphasis})`),
-        '',
-        'Notes:',
-        job.inputs.examPapers.length || job.inputs.examText
-          ? 'Exam-paper signals were prioritized above review text.'
-          : 'No exam paper provided; review signals remain lower priority.'
-      ];
-      const pdfBuffer = pdfRenderer.render(summaryLines);
+      const stageResult = runner.runStage('parsing-and-transcription', job);
+      validateStageOutput('parsing-and-transcription', stageResult);
+      updateStage(job, 'parsing-and-transcription', {
+        status: 'completed',
+        endedAt: nowIso(),
+        outputSummary: { chunks: stageResult.chunks.length, provider: stageResult.provider }
+      });
+      job.progress = 45;
+      await saveState();
+
+      const slides = slideParser.parse(job);
+      updateStage(job, 'slide-matching', { status: 'running', startedAt: nowIso() });
+      const matched = runner.runStage('slide-matching', { job, transcript: stageResult, slides });
+      validateStageOutput('slide-matching', matched);
+      updateStage(job, 'slide-matching', {
+        status: 'completed',
+        endedAt: nowIso(),
+        outputSummary: { annotations: matched.annotations.length }
+      });
+      job.progress = 70;
+      await saveState();
+
+      updateStage(job, 'packaging', { status: 'running', startedAt: nowIso() });
+      const summary = {
+        priorityOrder: buildPromptOrder(job),
+        transcriptionProvider: stageResult.provider
+      };
+      const pdfBuffer = runner.runStage('packaging', {
+        job,
+        annotations: matched.annotations,
+        summary
+      });
+      validateStageOutput('packaging', pdfBuffer);
       await storage.writeArtifact(jobId, 'study-packet.pdf', pdfBuffer);
       await storage.writeArtifact(jobId, 'result.json', Buffer.from(JSON.stringify({
-        annotations,
+        annotations: matched.annotations,
         summary: {
           priorityOrder: buildPromptOrder(job),
-          alignmentMode: 'placeholder',
+          alignmentMode: 'temporal-order',
           examPriorityApplied: Boolean(job.inputs.examPapers.length || job.inputs.examText)
         }
       }, null, 2)));
+      updateStage(job, 'packaging', {
+        status: 'completed',
+        endedAt: nowIso(),
+        outputSummary: { pdf: true }
+      });
 
       job.status = 'completed';
       job.progress = 100;
       job.updatedAt = nowIso();
       job.result = {
-        annotations,
+        annotations: matched.annotations,
         summary: {
           priorityOrder: buildPromptOrder(job),
-          alignmentMode: 'placeholder',
+          alignmentMode: 'temporal-order',
           examPriorityApplied: Boolean(job.inputs.examPapers.length || job.inputs.examText)
         }
       };
       await storage.saveJob(jobId, job);
     } catch (error) {
+      const failedStage = classifyJobStage(error.message || 'Unknown failure');
       job.status = 'failed';
       job.progress = 100;
       job.error = error.message || 'Unknown failure';
-      job.failedStage = classifyJobStage(job.error);
-      job.retryGuidance = `Retry from ${job.failedStage} after correcting the input or transient error.`;
+      job.failedStage = failedStage;
+      job.retryGuidance = `Retry from ${failedStage} after correcting the input or transient error.`;
+      updateStage(job, failedStage, { status: 'failed', endedAt: nowIso(), errorMessage: job.error });
       job.updatedAt = nowIso();
       await saveState();
     }
@@ -393,7 +307,7 @@ async function handleCreateJob(req, res) {
     return sendJson(res, 400, { error: 'The MVP supports one slide/PDF and one WAV audio file per job.' });
   }
 
-  const invalid = [...slideFiles, ...audioFiles, ...examFiles].find(file => file && !isSlideFile(file) && !isAudio(file) && !isTextFile(file));
+  const invalid = [...slideFiles, ...audioFiles, ...examFiles].find(file => file && !isPdf(file) && !isAudio(file) && !isTextFile(file));
   if (invalid) {
     return sendJson(res, 400, { error: `Unsupported file type: ${invalid.name || 'unknown file'}` });
   }
@@ -410,7 +324,7 @@ async function handleCreateJob(req, res) {
     const stored = [];
     for (const file of files) {
       const name = safeName(file.name);
-      const buffer = file.data ? base64ToBuffer(file.data) : Buffer.from(String(file.text || ''), 'utf8');
+      const buffer = file.data ? Buffer.from(String(file.data).split(',').pop(), 'base64') : Buffer.from(String(file.text || ''), 'utf8');
       const filePath = path.join(jobDir, `${kind}-${name}`);
       await fsp.writeFile(filePath, buffer);
       stored.push({
@@ -430,6 +344,9 @@ async function handleCreateJob(req, res) {
     createdAt: nowIso(),
     updatedAt: nowIso(),
     error: null,
+    failedStage: null,
+    retryGuidance: null,
+    stages: [],
     inputs: {
       slides: await saveFiles(slideFiles, 'slides'),
       audio: await saveFiles(audioFiles, 'audio'),
@@ -441,7 +358,7 @@ async function handleCreateJob(req, res) {
   };
 
   await storage.saveJob(jobId, job);
-  processJob(jobId);
+  processJob(jobId, copilotRunner);
   return sendJson(res, 201, { job: summarizeJob(job) });
 }
 
@@ -449,8 +366,17 @@ async function handleDeleteJob(req, res, jobId) {
   if (!jobs.has(jobId)) {
     return sendJson(res, 404, { error: 'Job not found' });
   }
-  await storage.deleteJob(jobId);
+  await deleteJobArtifacts(jobId);
+  await deleteJobRecord(jobId);
   return sendJson(res, 200, { ok: true });
+}
+
+async function handleJobDetail(req, res, jobId) {
+  const job = jobs.get(jobId);
+  if (!job) {
+    return sendJson(res, 404, { error: 'Job not found' });
+  }
+  return sendJson(res, 200, summarizeJob(job));
 }
 
 function sendJson(res, status, payload) {
@@ -459,19 +385,11 @@ function sendJson(res, status, payload) {
 }
 
 async function serveStatic(req, res, urlPath) {
-  let filePath = path.join(PUBLIC_DIR, urlPath === '/' ? 'index.html' : urlPath);
+  const filePath = path.join(PUBLIC_DIR, urlPath === '/' ? 'index.html' : urlPath);
   if (!filePath.startsWith(PUBLIC_DIR)) {
     res.writeHead(403);
     res.end('Forbidden');
     return;
-  }
-
-  async function handleJobDetail(req, res, jobId) {
-    const job = jobs.get(jobId);
-    if (!job) {
-      return sendJson(res, 404, { error: 'Job not found' });
-    }
-    return sendJson(res, 200, summarizeJob(job));
   }
   try {
     const data = await fsp.readFile(filePath);
@@ -496,7 +414,7 @@ async function start() {
     if (job.status === 'queued' || job.status === 'processing') {
       job.status = 'queued';
       job.progress = 0;
-      processJob(job.id);
+      processJob(job.id, copilotRunner);
     }
   }
 
@@ -507,15 +425,13 @@ async function start() {
         return sendJson(res, 200, { jobs: [...jobs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map(summarizeJob) });
       }
       if (req.method === 'GET' && /^\/api\/jobs\/[^/]+$/.test(url.pathname)) {
-        const jobId = url.pathname.split('/')[3];
-        return await handleJobDetail(req, res, jobId);
+        return await handleJobDetail(req, res, url.pathname.split('/')[3]);
       }
       if (req.method === 'POST' && url.pathname === '/api/jobs') {
         return await handleCreateJob(req, res);
       }
       if (req.method === 'DELETE' && /^\/api\/jobs\/[^/]+$/.test(url.pathname)) {
-        const jobId = url.pathname.split('/')[3];
-        return await handleDeleteJob(req, res, jobId);
+        return await handleDeleteJob(req, res, url.pathname.split('/')[3]);
       }
       if (req.method === 'GET' && /^\/api\/jobs\/[^/]+\/result\.pdf$/.test(url.pathname)) {
         const jobId = url.pathname.split('/')[3];
@@ -541,7 +457,7 @@ async function start() {
   });
 
   server.listen(PORT, () => {
-    console.log(`AgentA+ scaffold running at http://localhost:${PORT}`);
+    console.log(`AgentA+ running at http://localhost:${PORT}`);
   });
 }
 
