@@ -1,3 +1,5 @@
+name: Build and deploy Node.js app to Azure Web App
+
 # This workflow will build and push a node.js application to an Azure Web App when a commit is pushed to your default branch.
 #
 # This workflow assumes you have already created the target Azure App Service web app.
@@ -44,7 +46,7 @@ jobs:
 
     - name: npm install, build, and test
       run: |
-        npm install
+        npm ci
         npm run build --if-present
         npm run test --if-present
 
