@@ -4,9 +4,7 @@ const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
 const { createCopilotStageRunner } = require('./src/orchestration/copilot');
-const { runTranscriptStage } = require('./src/pipeline/transcript');
-const { runSlideMatchStage } = require('./src/pipeline/slide-match');
-const { runPackagingStage } = require('./src/pipeline/pdf');
+const { createCopilotSdkRunner } = require('./src/orchestration/copilot-sdk');
 
 const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
@@ -79,10 +77,17 @@ function createSlideParser() {
 
 const storage = createStorageAdapter();
 const slideParser = createSlideParser();
+const sdkRunner = createCopilotSdkRunner({
+  logger: console,
+  store: {
+    async getSlides(jobId) {
+      const job = jobs.get(jobId);
+      return job ? job.inputs.slides : [];
+    }
+  }
+});
 const copilotRunner = createCopilotStageRunner({
-  transcriptStage: runTranscriptStage,
-  matchStage: runSlideMatchStage,
-  packageStage: runPackagingStage
+  sdkRunner
 });
 
 async function readJson(file, fallback) {
@@ -194,7 +199,8 @@ async function processJob(jobId, runner) {
       updateStage(job, 'parsing-and-transcription', { status: 'running', startedAt: nowIso() });
       await saveState();
 
-      const stageResult = runner.runStage('parsing-and-transcription', job);
+      const pipelineResult = await runner.runPipeline(job);
+      const stageResult = pipelineResult.transcript;
       validateStageOutput('parsing-and-transcription', stageResult);
       updateStage(job, 'parsing-and-transcription', {
         status: 'completed',
@@ -204,9 +210,8 @@ async function processJob(jobId, runner) {
       job.progress = 45;
       await saveState();
 
-      const slides = slideParser.parse(job);
       updateStage(job, 'slide-matching', { status: 'running', startedAt: nowIso() });
-      const matched = runner.runStage('slide-matching', { job, transcript: stageResult, slides });
+      const matched = { annotations: pipelineResult.annotations };
       validateStageOutput('slide-matching', matched);
       updateStage(job, 'slide-matching', {
         status: 'completed',
@@ -221,11 +226,7 @@ async function processJob(jobId, runner) {
         priorityOrder: buildPromptOrder(job),
         transcriptionProvider: stageResult.provider
       };
-      const pdfBuffer = runner.runStage('packaging', {
-        job,
-        annotations: matched.annotations,
-        summary
-      });
+      const pdfBuffer = await sdkRunner.package(job, matched.annotations, summary);
       validateStageOutput('packaging', pdfBuffer);
       await storage.writeArtifact(jobId, 'study-packet.pdf', pdfBuffer);
       await storage.writeArtifact(jobId, 'result.json', Buffer.from(JSON.stringify({
