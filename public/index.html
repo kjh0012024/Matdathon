@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>에이전트A+ MVP</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Anonymous web MVP</p>
+        <h1>에이전트A+</h1>
+        <p class="lede">강의 슬라이드와 음성, 선택적 족보/강의평을 받아 비동기식 주석 PDF 학습 자료를 만드는 로컬 스캐폴드입니다.</p>
+      </div>
+      <div class="badge">Exam papers outrank reviews</div>
+    </section>
+
+    <section class="card">
+      <h2>Create job</h2>
+      <form id="uploadForm">
+        <label>Lecture slides / PDF
+          <input id="slides" type="file" accept="application/pdf,.pdf" multiple required />
+        </label>
+        <label>Lecture audio
+          <input id="audio" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac,.webm" multiple required />
+        </label>
+        <label>Exam papers / past tests (optional)
+          <input id="examPapers" type="file" accept="application/pdf,.pdf,text/plain,.txt,.md,.json" multiple />
+        </label>
+        <label>Exam text (optional)
+          <textarea id="examText" rows="5" placeholder="Paste previous-test text or exam hints here."></textarea>
+        </label>
+        <label>Course reviews / exam info (optional)
+          <textarea id="reviewText" rows="4" placeholder="Lower-priority signal compared with exam papers."></textarea>
+        </label>
+        <button type="submit">Start async processing</button>
+        <p id="message" class="message"></p>
+      </form>
+    </section>
+
+    <section class="card">
+      <div class="row">
+        <h2>Jobs</h2>
+        <button id="refreshBtn" type="button" class="ghost">Refresh</button>
+      </div>
+      <div id="jobs" class="jobs"></div>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
