@@ -41,7 +41,7 @@ function renderJobs(jobs) {
       <div class="meta">Created ${new Date(job.createdAt).toLocaleString()}</div>
       <div class="grid">
         <div><span>Slides</span>${job.inputs.slides.length}</div>
-        <div><span>Audio</span>${job.inputs.audio.length}</div>
+        <div><span>WAV audio</span>${job.inputs.audio.length}</div>
         <div><span>Exam papers</span>${job.inputs.examPapers.length}</div>
       </div>
       ${job.error ? `<p class="error">${job.error}</p>` : ''}

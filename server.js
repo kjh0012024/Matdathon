@@ -13,6 +13,7 @@ const STATE_FILE = path.join(DATA_DIR, 'state.json');
 
 const jobs = new Map();
 const scheduled = new Map();
+const supportedAudioExts = new Set(['.wav']);
 
 async function ensureDirs() {
   await fsp.mkdir(PUBLIC_DIR, { recursive: true });
@@ -32,13 +33,78 @@ function isPdf(file) {
 }
 
 function isAudio(file) {
-  const audioExts = new Set(['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac', '.webm']);
-  return (file?.type || '').startsWith('audio/') || audioExts.has(extName(file?.name));
+  return (file?.type || '').startsWith('audio/') || supportedAudioExts.has(extName(file?.name));
 }
 
 function isTextFile(file) {
   return file?.type === 'text/plain' || ['.txt', '.md', '.json'].includes(extName(file?.name));
 }
+
+function createStorageAdapter() {
+  return {
+    async saveJob(jobId, job) {
+      jobs.set(jobId, job);
+      await saveState();
+    },
+    async loadJobs() {
+      return [...jobs.values()];
+    },
+    async writeArtifact(jobId, fileName, buffer) {
+      const jobDir = path.join(JOBS_DIR, jobId);
+      await fsp.mkdir(jobDir, { recursive: true });
+      const filePath = path.join(jobDir, fileName);
+      await fsp.writeFile(filePath, buffer);
+      return filePath;
+    },
+    async readArtifact(jobId, fileName) {
+      return fsp.readFile(path.join(JOBS_DIR, jobId, fileName));
+    }
+  };
+}
+
+function createTranscriptAdapter() {
+  return {
+    transcribe(job) {
+      return {
+        provider: 'local-placeholder',
+        chunks: job.inputs.audio.map((file, index) => ({
+          id: index + 1,
+          start: index * 60,
+          end: (index + 1) * 60,
+          text: `Transcript chunk from ${file.name}`
+        }))
+      };
+    }
+  };
+}
+
+function createSlideParser() {
+  return {
+    parse(job) {
+      const slideCount = Math.max(1, job.inputs.slides.length);
+      return job.inputs.slides.map((file, index) => ({
+        page: index + 1,
+        title: `Slide ${index + 1}`,
+        source: file.name,
+        content: `Parsed content from ${file.name}`,
+        slideCount
+      }));
+    }
+  };
+}
+
+function createPdfRenderer() {
+  return {
+    render(lines) {
+      return buildPdfBuffer(lines);
+    }
+  };
+}
+
+const storage = createStorageAdapter();
+const transcriptAdapter = createTranscriptAdapter();
+const slideParser = createSlideParser();
+const pdfRenderer = createPdfRenderer();
 
 async function readJson(file, fallback) {
   try {
@@ -108,18 +174,17 @@ function buildPromptOrder(job) {
   return priorities;
 }
 
-function makeAnnotations(job) {
-  const slideCount = Math.max(1, job.inputs.slides.length);
-  const transcriptChunks = Math.max(2, job.inputs.audio.length * 2);
-  const annotations = [];
-  for (let i = 0; i < slideCount; i += 1) {
-    annotations.push({
-      slide: i + 1,
-      transcriptRef: `Transcript chunk ${((i % transcriptChunks) + 1)}`,
-      emphasis: i === 0 ? 'Priority topic from lecture + exam signals' : 'Placeholder alignment'
-    });
-  }
-  return annotations;
+function makeAnnotations(job, transcript) {
+  const slides = slideParser.parse(job);
+  const chunks = transcript.chunks.length ? transcript.chunks : [{ id: 1, text: 'No audio transcript available' }];
+  return slides.map((slide, index) => ({
+    slide: slide.page,
+    transcriptRef: `Transcript chunk ${chunks[index % chunks.length].id}`,
+    emphasis: index === 0
+      ? 'Priority topic from lecture + exam signals'
+      : 'Placeholder alignment',
+    slideTitle: slide.title
+  }));
 }
 
 function escapePdfText(text) {
@@ -174,12 +239,13 @@ async function processJob(jobId) {
       job.updatedAt = nowIso();
       await saveState();
 
-      await fsp.mkdir(path.join(JOBS_DIR, jobId), { recursive: true });
-      const annotations = makeAnnotations(job);
+      const transcript = transcriptAdapter.transcribe(job);
+      const annotations = makeAnnotations(job, transcript);
       const summaryLines = [
         'AgentA+ Study Packet',
         `Job: ${job.id}`,
         `Priority order: ${buildPromptOrder(job).join(' > ') || 'lecture materials'}`,
+        `Audio transcription: ${transcript.provider}`,
         `Slides: ${job.inputs.slides.length}`,
         `Audio files: ${job.inputs.audio.length}`,
         `Exam papers: ${job.inputs.examPapers.length}`,
@@ -194,17 +260,17 @@ async function processJob(jobId) {
           ? 'Exam-paper signals were prioritized above review text.'
           : 'No exam paper provided; review signals remain lower priority.'
       ];
-      const pdfBuffer = buildPdfBuffer(summaryLines);
+      const pdfBuffer = pdfRenderer.render(summaryLines);
       const jobDir = path.join(JOBS_DIR, jobId);
-      await fsp.writeFile(path.join(jobDir, 'study-packet.pdf'), pdfBuffer);
-      await fsp.writeFile(path.join(jobDir, 'result.json'), JSON.stringify({
+      await storage.writeArtifact(jobId, 'study-packet.pdf', pdfBuffer);
+      await storage.writeArtifact(jobId, 'result.json', Buffer.from(JSON.stringify({
         annotations,
         summary: {
           priorityOrder: buildPromptOrder(job),
           alignmentMode: 'placeholder',
           examPriorityApplied: Boolean(job.inputs.examPapers.length || job.inputs.examText)
         }
-      }, null, 2));
+      }, null, 2)));
 
       job.status = 'completed';
       job.progress = 100;
@@ -217,7 +283,7 @@ async function processJob(jobId) {
           examPriorityApplied: Boolean(job.inputs.examPapers.length || job.inputs.examText)
         }
       };
-      await saveState();
+      await storage.saveJob(jobId, job);
     } catch (error) {
       job.status = 'failed';
       job.progress = 100;
@@ -268,6 +334,10 @@ async function handleCreateJob(req, res) {
     return sendJson(res, 400, { error: `Unsupported file type: ${invalid.name || 'unknown file'}` });
   }
 
+  if (jobs.size > 0) {
+    return sendJson(res, 409, { error: 'Only one active job is supported in the MVP.' });
+  }
+
   const jobId = makeJobId();
   const jobDir = path.join(JOBS_DIR, jobId);
   await fsp.mkdir(jobDir, { recursive: true });
@@ -306,8 +376,7 @@ async function handleCreateJob(req, res) {
     result: null
   };
 
-  jobs.set(jobId, job);
-  await saveState();
+  await storage.saveJob(jobId, job);
   processJob(jobId);
   return sendJson(res, 201, { job: summarizeJob(job) });
 }
